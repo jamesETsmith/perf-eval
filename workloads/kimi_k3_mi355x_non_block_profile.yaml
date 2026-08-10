@@ -1,0 +1,54 @@
+name: kimi-k3-mi355x-non-block-profile
+gpu: MI355X
+num_gpus: 8
+nightly: false
+
+vllm:
+  model: moonshotai/Kimi-K3
+  image: vllm/vllm-openai-rocm@sha256:5aa7e626ff73672f5ca7aae46754570488c23d33ca1ac90756a1d2d1a3fe099b
+  env:
+    HF_HOME: /shared_nfs/huggingface
+    HF_HUB_OFFLINE: 1
+    OMP_NUM_THREADS: 8
+    VLLM_ROCM_USE_AITER: 1
+    VLLM_ROCM_USE_AITER_MOE: 1
+    VLLM_ROCM_USE_AITER_MLA: 1
+    AITER_SITUV2_A8W4: 0
+  serve_args: >-
+    --tensor-parallel-size 8
+    --trust-remote-code
+    --enable-prefix-caching
+    --max-model-len 65536
+    --max-num-seqs 128
+    --gpu-memory-utilization 0.95
+    --profiler-config.profiler torch
+    --profiler-config.torch_profiler_dir /profiles
+    --profiler-config.torch_profiler_with_stack false
+    --profiler-config.torch_profiler_use_gzip true
+    --profiler-config.torch_profiler_dump_cuda_time_total true
+
+vllm_bench:
+  metadata:
+    device: mi355x
+    tp: 8
+    precision: mxfp4
+    workload: 50k-in-100-out-40k-cached
+    image_digest: sha256:5aa7e626ff73672f5ca7aae46754570488c23d33ca1ac90756a1d2d1a3fe099b
+    model_weights: /shared_nfs/huggingface/hub/models--moonshotai--Kimi-K3/
+  configs:
+    - name: 50k-in-100-out-40k-cached-conc-4
+      backend: openai
+      dataset: prefix_repetition
+      input_len: 50000
+      output_len: 100
+      num_prompts: 40
+      max_concurrency: 4
+      args:
+        num_warmups: 32
+        percentile_metrics: ttft,tpot,itl,e2el
+        prefix_repetition_num_prefixes: 1
+        prefix_repetition_prefix_len: 40000
+        prefix_repetition_suffix_len: 10000
+        prefix_repetition_output_len: 100
+        disable_tqdm: true
+        profile: true
