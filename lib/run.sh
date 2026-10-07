@@ -15,11 +15,16 @@ source "$DIR/server.sh"
 source "$DIR/run_lm_eval.sh"
 # shellcheck disable=SC1091
 source "$DIR/run_vllm_bench.sh"
+# shellcheck disable=SC1091
+source "$DIR/run_aiperf.sh"
+# shellcheck disable=SC1091
+source "$DIR/nsys.sh"
 WORKLOAD_EXPORTS="$(python3 "$DIR/parse_workload.py" "$WORKLOAD")"
 eval "$WORKLOAD_EXPORTS"
 export WORKLOAD_IMAGE WORKLOAD_VLLM_COMMIT WORKLOAD_SERVER_RUNTIME
+echo "image: $WORKLOAD_IMAGE  commit: ${WORKLOAD_VLLM_COMMIT:-unknown}"
 
-PORT=8000
+PORT="${PERF_EVAL_SERVER_PORT:-$(pick_server_port)}"
 CONTAINER="perf-eval-${WORKLOAD_NAME}-$$"
 RESULTS_DIR="results/${WORKLOAD_NAME}"
 BASE_URL="http://localhost:${PORT}"
@@ -40,34 +45,33 @@ PROVENANCE_ARGS=(
   --environment "$WORKLOAD_ENV"
 )
 if [[ -n "$WORKLOAD_BUILD_DOCKERFILE" ]]; then
-  BUILD_CONTEXT="$(realpath "$WORKLOAD_BUILD_CONTEXT")"
-  BUILD_DOCKERFILE="$WORKLOAD_BUILD_DOCKERFILE"
-  if [[ "$BUILD_DOCKERFILE" != /* ]]; then
-    BUILD_DOCKERFILE="${BUILD_CONTEXT}/${BUILD_DOCKERFILE}"
-  fi
-  [[ -d "$BUILD_CONTEXT" ]] || { echo "build context not found: $BUILD_CONTEXT" >&2; exit 2; }
+  BUILD_DOCKERFILE="$(realpath "$WORKLOAD_BUILD_DOCKERFILE")"
   [[ -f "$BUILD_DOCKERFILE" ]] || { echo "Dockerfile not found: $BUILD_DOCKERFILE" >&2; exit 2; }
   BUILD_IMAGE_ID="$(python3 "$DIR/provenance.py" build \
     --image "$WORKLOAD_IMAGE" \
-    --dockerfile "$BUILD_DOCKERFILE" \
-    --context "$BUILD_CONTEXT" \
-    --args-json "$WORKLOAD_BUILD_ARGS_JSON")"
+    --dockerfile "$BUILD_DOCKERFILE")"
   PROVENANCE_ARGS+=(
     --image-id "$BUILD_IMAGE_ID"
     --dockerfile "$BUILD_DOCKERFILE"
-    --context "$BUILD_CONTEXT"
-    --args-json "$WORKLOAD_BUILD_ARGS_JSON"
   )
 fi
 python3 "$DIR/provenance.py" "${PROVENANCE_ARGS[@]}"
 WORKLOAD_PROVENANCE_FILE="${RESULTS_DIR}/provenance/manifest.json"
 export WORKLOAD_PROVENANCE_FILE
 
-trap 'stop_server "$CONTAINER"' EXIT
+# nsys profiling (NVIDIA profiles only, see parse_workload.py) needs a
+# vllm_bench config to drive the profiled run.
+NSYS_BENCH_ROW="$(head -n 1 <<< "$WORKLOAD_VLLM_BENCH_TSV")"
+if [[ "$WORKLOAD_NSYS" == "true" && -n "$NSYS_BENCH_ROW" ]]; then
+  nsys_configure "$WORKLOAD_SERVER_RUNTIME" "$RESULTS_DIR" \
+                 "${WORKLOAD_NAME}-${NSYS_BENCH_ROW%%$'\t'*}"
+fi
+
+trap 'nsys_finalize "$CONTAINER"; stop_server "$CONTAINER"' EXIT
 
 start_server "$CONTAINER" "$PORT" "$WORKLOAD_IMAGE" "$WORKLOAD_MODEL" \
              "$WORKLOAD_SERVE_ARGS" "$WORKLOAD_ENV" "$WORKLOAD_SERVER_RUNTIME"
-wait_healthy "$PORT"
+wait_healthy "$PORT" "$WORKLOAD_SERVER_STARTUP_TIMEOUT" "$WORKLOAD_MODEL"
 
 # vllm bench serve runs first so we can validate perf flow without waiting
 # on a full lm_eval pass. Each config's raw json lands in
@@ -90,6 +94,20 @@ while IFS=$'\t' read -r bname backend dataset isl osl nprompts conc repetitions 
     --image "$WORKLOAD_IMAGE" \
     --isl "$isl" --osl "$osl" --conc "$conc" || true
 done <<< "$WORKLOAD_VLLM_BENCH_TSV"
+
+# Profiled pass after the measured runs, so they stay untraced.
+if [[ -n "$NSYS_REPORT" ]]; then
+  run_nsys_profile "$CONTAINER" "$PORT" "$WORKLOAD_MODEL" "$NSYS_BENCH_ROW" \
+                   "$BENCH_TRUST_REMOTE_CODE" "$RESULTS_DIR"
+fi
+
+# aiperf profile runs (perf, like vllm_bench). Artifacts are uploaded via the
+# Buildkite artifact_paths glob; there is no dashboard ingest for aiperf yet.
+while IFS=$'\t' read -r aname aargs; do
+  [[ -z "$aname" ]] && continue
+  run_aiperf "$CONTAINER" "$PORT" "$WORKLOAD_MODEL" \
+             "$aname" "$aargs" "$RESULTS_DIR"
+done <<< "$WORKLOAD_AIPERF_TSV"
 
 if [[ "${BENCH_ONLY:-}" =~ ^([Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss])$ ]]; then
   echo "--- :stopwatch: BENCH_ONLY set; skipping lm_eval and bfcl tasks"

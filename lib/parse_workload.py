@@ -7,9 +7,12 @@ projects it into shell variables: top-level metadata, server config
 (image, model, serve_args, env, runtime), the lm_eval task list, the
 vllm_bench config list, and bench ingest metadata (device/tp/precision).
 
-Image precedence: VLLM_IMAGE > VLLM_COMMIT > workload `vllm.image` >
-`vllm/vllm-openai:latest`. When BENCH_ONLY is truthy, lm_eval task names
-are not validated against the registry (because they will not run).
+Image precedence: VLLM_IMAGE_CUDA / VLLM_IMAGE_ROCM (whichever matches the
+workload's GPU) > VLLM_IMAGE > VLLM_COMMIT > workload `vllm.image` >
+`vllm/vllm-openai:latest`. A build that pins images per platform but not this
+workload's, and sets no VLLM_IMAGE, has nothing to run here and is an error.
+When BENCH_ONLY is truthy, lm_eval task names are not validated against the
+registry (because they will not run).
 """
 
 from __future__ import annotations
@@ -38,12 +41,20 @@ BENCH_RESERVED_ARGS = {
     "speed-bench-category", "skip-tokenizer-init", "save-result",
     "result-filename",
 }
+AIPERF_FIELDS = {"name", "args"}
+AIPERF_REQUIRED = ("name",)
+AIPERF_RESERVED_ARGS = {
+    "model", "tokenizer", "url", "api-key", "output-artifact-dir",
+}
 BFCL_FIELDS = {
     "test_categories", "num_threads", "temperature",
     "maximum_step_limit", "max_test_cases",
 }
 BFCL_DEFAULT_MAXIMUM_STEP_LIMIT = 10
-BUILD_FIELDS = {"dockerfile", "context", "args"}
+BUILD_FIELDS = {"dockerfile"}
+SENSITIVE_NAME = re.compile(
+    r"(?:token|secret|password|passwd|api[_-]?key|credential)", re.IGNORECASE
+)
 BFCL_KNOWN_CATEGORIES = {
     "simple_python", "simple_java", "simple_javascript",
     "multiple", "parallel", "parallel_multiple", "irrelevance",
@@ -96,8 +107,12 @@ def known_task_names() -> set:
 
 
 def load_profile(gpu: str, workload_path: str) -> dict:
-    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(workload_path)))
-    profiles_path = os.path.join(repo_root, "lib", "gpu_profiles.yaml")
+    configured_path = (os.environ.get("PERF_EVAL_PROFILES_FILE") or "").strip()
+    if configured_path:
+        profiles_path = configured_path
+    else:
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(workload_path)))
+        profiles_path = os.path.join(repo_root, "lib", "gpu_profiles.yaml")
     with open(profiles_path) as f:
         profiles = yaml.safe_load(f)
     if gpu not in profiles:
@@ -105,19 +120,83 @@ def load_profile(gpu: str, workload_path: str) -> dict:
     return profiles[gpu]
 
 
+def platform_of(profile: dict) -> str:
+    """The platform a profile runs, from the repo its images come from."""
+    repo = (profile.get("image_repo") or "").strip() or "vllm/vllm-openai"
+    return "ROCM" if "rocm" in repo.lower() else "CUDA"
+
+
+def platform_image(profile: dict) -> str:
+    """VLLM_IMAGE_CUDA / VLLM_IMAGE_ROCM — this platform's image, if pinned.
+
+    For a build whose platforms are separate artifacts with unrelated tags,
+    which nothing else here can name.
+    """
+    return (os.environ.get(f"VLLM_IMAGE_{platform_of(profile)}") or "").strip()
+
+
+def pins_only_other_platforms(profile: dict) -> bool:
+    """True when the build pins per-platform images, but not this platform's."""
+    mine = f"VLLM_IMAGE_{platform_of(profile)}"
+    return any(
+        (os.environ.get(k) or "").strip()
+        for k in ("VLLM_IMAGE_CUDA", "VLLM_IMAGE_ROCM")
+        if k != mine
+    )
+
+
+def nsys_enabled(profile: dict) -> bool:
+    """Whether to capture an Nsight Systems trace of the server.
+
+    On by default for profiles that set `nsys: true`; NSYS_PROFILE overrides
+    that either way for the whole build. nsys is NVIDIA-only, so ROCm
+    profiles never enable it.
+    """
+    if platform_of(profile) != "CUDA":
+        return False
+    if (os.environ.get("NSYS_PROFILE") or "").strip():
+        return env_truthy("NSYS_PROFILE")
+    return profile.get("nsys") is True
+
+
 def resolve_image(vllm: dict, profile: dict) -> tuple[str, str]:
-    """Pick the image and commit using VLLM_IMAGE / VLLM_COMMIT / workload."""
+    """Pick the image and commit using VLLM_IMAGE / VLLM_COMMIT / workload.
+
+    A workload that sets ``pin_image: true`` keeps its own ``vllm.image`` even
+    when VLLM_IMAGE / VLLM_COMMIT or a platform pin are set. Use it for models
+    that only exist in a dedicated image (e.g. kimi-k3, minimax-m3) where the
+    nightly override would pull an image that cannot serve the model. Failing
+    that, VLLM_IMAGE_CUDA / VLLM_IMAGE_ROCM decide their own platform.
+    """
     override_image = (os.environ.get("VLLM_IMAGE") or "").strip()
     override_commit = (os.environ.get("VLLM_COMMIT") or "").strip()
     # ROCm images are located at vllm/vllm-openai-rocm. The default
     # images (CUDA) are stored at vllm/vllm-openai
     custom_repo = (profile.get("image_repo") or "").strip()
     repo = custom_repo or "vllm/vllm-openai"
-    # Don't use VLLM_IMAGE for AMD workloads unless it is a ROCm image
-    if override_image and (not custom_repo or "rocm" in override_image.lower()):
-        return override_image, override_commit or commit_from_image(override_image)
+    if vllm.get("pin_image") is True and vllm.get("image"):
+        image = vllm["image"]
+        return image, commit_from_image(str(image))
+    platform_pin = platform_image(profile)
+    if platform_pin:
+        return platform_pin, override_commit or commit_from_image(platform_pin)
+    # This build pins images per platform and didn't pin ours. The generator
+    # skips these workloads, so only a direct run.sh gets here.
+    if pins_only_other_platforms(profile) and not override_image:
+        platform = platform_of(profile)
+        sys.exit(f"no {platform} image: set VLLM_IMAGE_{platform} or VLLM_IMAGE")
 
-    commit = override_commit or commit_from_image(override_image)
+    # Don't use VLLM_IMAGE for AMD workloads unless it is a ROCm image.
+    # A CUDA release image may embed a commit in its tag, but that must not
+    # implicitly select an unrelated ROCm nightly for AMD jobs.
+    if override_image:
+        if not custom_repo or "rocm" in override_image.lower():
+            return override_image, override_commit or commit_from_image(override_image)
+        if not override_commit:
+            image = vllm.get("image", f"{repo}:nightly")
+            return image, commit_from_image(str(image))
+
+    commit = override_commit
     if commit:
         return f"{repo}:nightly-{commit}", commit
 
@@ -136,22 +215,19 @@ def validate_build(vllm: dict, profile: dict, path: str) -> dict:
         sys.exit(f"{path}: vllm.build has unsupported fields {sorted(extra)}")
     if not vllm.get("image"):
         sys.exit(f"{path}: vllm.build requires an explicit vllm.image tag")
-    if os.environ.get("VLLM_IMAGE") or os.environ.get("VLLM_COMMIT"):
-        sys.exit(f"{path}: vllm.build cannot be combined with VLLM_IMAGE or VLLM_COMMIT")
+    image_overrides = (
+        "VLLM_IMAGE", "VLLM_IMAGE_CUDA", "VLLM_IMAGE_ROCM", "VLLM_COMMIT"
+    )
+    if any((os.environ.get(name) or "").strip() for name in image_overrides):
+        sys.exit(f"{path}: vllm.build cannot be combined with image overrides")
+    if vllm.get("pin_image"):
+        sys.exit(f"{path}: vllm.build cannot be combined with vllm.pin_image")
     if profile.get("server_runtime", "docker") != "docker":
         sys.exit(f"{path}: vllm.build requires a docker server runtime")
     dockerfile = build.get("dockerfile")
-    context = build.get("context", ".")
-    args = build.get("args") or {}
     if not isinstance(dockerfile, str) or not dockerfile.strip():
         sys.exit(f"{path}: vllm.build.dockerfile must be a non-empty path")
-    if not isinstance(context, str) or not context.strip():
-        sys.exit(f"{path}: vllm.build.context must be a non-empty path")
-    if not isinstance(args, dict):
-        sys.exit(f"{path}: vllm.build.args must be a map")
-    if any(not isinstance(name, str) or not name for name in args):
-        sys.exit(f"{path}: vllm.build.args keys must be non-empty strings")
-    return {"dockerfile": dockerfile, "context": context, "args": args}
+    return {"dockerfile": dockerfile}
 
 
 def parse_tp(serve_args: str) -> int:
@@ -220,31 +296,42 @@ def normalize_bench_arg_name(name: str) -> str:
     return name.lstrip("-").replace("_", "-")
 
 
-def encode_bench_args(args: object, config_name: str, path: str) -> str:
+def encode_arg_map(
+    args: object, config_name: str, path: str, reserved: set, kind: str
+) -> str:
+    """Normalize a config `args` map to `--kebab-case` keys and base64-encode it.
+
+    Shared by vllm_bench and aiperf; each passes its own set of wrapper-owned
+    reserved options that a workload must not override.
+    """
     if args is None:
         args = {}
     if not isinstance(args, dict):
-        sys.exit(f"{path}: vllm_bench config {config_name!r} args must be a map")
+        sys.exit(f"{path}: {kind} config {config_name!r} args must be a map")
     normalized = {}
     for name, value in args.items():
         if not isinstance(name, str) or not normalize_bench_arg_name(name):
             sys.exit(
-                f"{path}: vllm_bench config {config_name!r} args keys must be non-empty strings"
+                f"{path}: {kind} config {config_name!r} args keys must be non-empty strings"
             )
         normalized_name = normalize_bench_arg_name(name)
-        if normalized_name in BENCH_RESERVED_ARGS:
+        if normalized_name in reserved:
             sys.exit(
-                f"{path}: vllm_bench config {config_name!r} args cannot override "
+                f"{path}: {kind} config {config_name!r} args cannot override "
                 f"wrapper-owned option --{normalized_name}"
             )
         if normalized_name in normalized:
             sys.exit(
-                f"{path}: vllm_bench config {config_name!r} args contains duplicate "
+                f"{path}: {kind} config {config_name!r} args contains duplicate "
                 f"option --{normalized_name} after normalization"
             )
         normalized[normalized_name] = value
     payload = json.dumps(normalized, separators=(",", ":")).encode()
     return base64.b64encode(payload).decode()
+
+
+def encode_bench_args(args: object, config_name: str, path: str) -> str:
+    return encode_arg_map(args, config_name, path, BENCH_RESERVED_ARGS, "vllm_bench")
 
 
 def expand_bench_config(c: dict, path: str) -> list:
@@ -349,6 +436,40 @@ def bench_tsv(configs: list, path: str) -> str:
     return "\n".join(lines)
 
 
+def aiperf_tsv(configs: list, path: str) -> str:
+    """Emit one row per aiperf config: name plus base64-encoded arg map.
+
+    The wrapper owns --model, --tokenizer, --url, --api-key, and
+    --output-artifact-dir; everything else the profile needs goes under `args`.
+    """
+    seen = set()
+    lines = []
+    for c in configs:
+        extra = set(c) - AIPERF_FIELDS
+        if extra:
+            sys.exit(
+                f"{path}: aiperf config {c.get('name')!r} has unsupported "
+                f"fields {sorted(extra)}; allowed: {sorted(AIPERF_FIELDS)}"
+            )
+        for k in AIPERF_REQUIRED:
+            if c.get(k) is None:
+                sys.exit(f"{path}: aiperf config {c.get('name')!r} missing required field {k!r}")
+        if c["name"] in seen:
+            sys.exit(f"{path}: duplicate aiperf config name {c['name']!r}")
+        seen.add(c["name"])
+        lines.append(
+            "\t".join(
+                [
+                    c["name"],
+                    encode_arg_map(
+                        c.get("args"), c["name"], path, AIPERF_RESERVED_ARGS, "aiperf"
+                    ),
+                ]
+            )
+        )
+    return "\n".join(lines)
+
+
 def _validate_bfcl_limits(bfcl: dict, path: str) -> None:
     limit = bfcl.get("maximum_step_limit")
     if limit is not None and (not isinstance(limit, int) or limit < 1):
@@ -436,25 +557,43 @@ def main(path: str) -> None:
     lm_eval = data.get("lm_eval") or {}
     bench = data.get("vllm_bench") or {}
 
+    aiperf = data.get("aiperf") or {}
+
     tasks = lm_eval.get("tasks") or []
     bfcl = data.get("bfcl") or {}
     bench_configs = bench.get("configs") or []
+    aiperf_configs = aiperf.get("configs") or []
 
-    if not tasks and not bench_configs and not bfcl:
+    if not tasks and not bench_configs and not bfcl and not aiperf_configs:
         sys.exit(
-            f"{path}: workload must define at least one of lm_eval, vllm_bench, or bfcl"
+            f"{path}: workload must define at least one of lm_eval, vllm_bench, "
+            f"aiperf, or bfcl"
         )
 
     if tasks:
         validate_tasks(tasks, path)
 
     serve_args = vllm.get("serve_args") or ""
+    startup_timeout_s = vllm.get("startup_timeout_s", 3600)
+    if (
+        isinstance(startup_timeout_s, bool)
+        or not isinstance(startup_timeout_s, int)
+        or startup_timeout_s < 1
+    ):
+        sys.exit(f"{path}: vllm.startup_timeout_s must be a positive integer")
     if bfcl:
         validate_bfcl(bfcl, serve_args, path)
     build = validate_build(vllm, profile, path)
 
     image, vllm_commit = resolve_image(vllm, profile)
-    env = {**(profile.get("env") or {}), **(vllm.get("env") or {})}
+    workload_env = vllm.get("env") or {}
+    sensitive_env = sorted(str(name) for name in workload_env if SENSITIVE_NAME.search(str(name)))
+    if sensitive_env:
+        sys.exit(
+            f"{path}: credentials must not be stored in vllm.env: {sensitive_env}; "
+            "use the existing external secret injection paths"
+        )
+    env = {**(profile.get("env") or {}), **workload_env}
     if "HF_HOME" not in env and profile.get("hf_home"):
         env["HF_HOME"] = profile["hf_home"]
 
@@ -468,13 +607,14 @@ def main(path: str) -> None:
     emit("VLLM_COMMIT", vllm_commit)
     emit("MODEL", vllm.get("model", ""))
     emit("SERVE_ARGS", serve_args)
+    emit("SERVER_STARTUP_TIMEOUT", startup_timeout_s)
     emit("SERVER_RUNTIME", profile.get("server_runtime", "docker"))
     emit("BUILD_DOCKERFILE", build.get("dockerfile", ""))
-    emit("BUILD_CONTEXT", build.get("context", ""))
-    emit("BUILD_ARGS_JSON", json.dumps(build.get("args", {}), separators=(",", ":")))
+    emit("NSYS", "true" if nsys_enabled(profile) else "false")
     emit("ENV", "\n".join(f"{k}={fmt(v)}" for k, v in env.items()))
     emit("LM_EVAL_TASKS_TSV", task_tsv(tasks, lm_eval.get("model_args") or {}))
     emit("VLLM_BENCH_TSV", bench_tsv(bench_configs, path))
+    emit("AIPERF_TSV", aiperf_tsv(aiperf_configs, path))
     emit("BFCL_TSV", bfcl_tsv(bfcl) if bfcl else "")
     emit("BENCH_DEVICE", metadata.get("device") or gpu.lower())
     emit("BENCH_TP", tp)

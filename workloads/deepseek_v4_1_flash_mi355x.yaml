@@ -1,19 +1,29 @@
-# DeepSeek-V4-Pro on MI355X
-name: deepseek_v4_pro-mi355x
+# DeepSeek-V4.1-Flash on MI355X
+name: deepseek_v4_1_flash_mi355x
 gpu: MI355X
 num_gpus: 8
 nightly: true
 
 vllm:
-  model: deepseek-ai/DeepSeek-V4-Pro
+  model: deepseek-ai/DeepSeek-V4.1-Flash
   env:
+    VLLM_ENGINE_READY_TIMEOUT_S: 3600
     VLLM_ROCM_USE_AITER: 1
+    VLLM_ROCM_USE_AITER_MOE: 1
+    AITER_TRITON_LOG_LEVEL: ERROR
+    VLLM_USE_BREAKABLE_CUDAGRAPH: 1
   serve_args: >-
-    --tensor-parallel-size 8
-    --kv-cache-dtype fp8
-    --trust-remote-code
-    --no-enable-prefix-caching
-    --quantization deepseek_v4_fp8
+    --tokenizer-mode deepseek_v41
+    --tensor-parallel-size 4
+    --gpu-memory-utilization 0.9
+    --moe-backend aiter
+    --no-swa-bounded-replay
+    --engram-config {"cpu_offload":true}
+    --tool-call-parser deepseek_v41
+    --enable-auto-tool-choice
+    --reasoning-parser deepseek_v41
+    --mm-encoder-tp-mode data
+    --kv-transfer-config {"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":549755813888,"blocks_per_chunk":4}}
 
 lm_eval:
   model_args:

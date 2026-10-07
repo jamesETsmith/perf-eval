@@ -1,17 +1,16 @@
-# Gemma4 31B (FP8) on H200 (8xH200, TP=1)
-name: gemma_4_31b_it_h200
+name: glm_5_3_flash-h200
 gpu: H200
 num_gpus: 8
 nightly: true
-timeout_in_minutes: 240
 
 vllm:
-  model: RedHatAI/gemma-4-31B-it-FP8-dynamic
+  model: zai-org/GLM-5.3-Flash
   serve_args: >-
-    --tensor-parallel-size 1
-    --kv-cache-dtype fp8
-    --tool-call-parser gemma4
-    --reasoning-parser gemma4
+    --tensor-parallel-size 8
+    --speculative-config.method mtp
+    --speculative-config.num_speculative_tokens 5
+    --tool-call-parser glm47
+    --reasoning-parser glm45
     --enable-auto-tool-choice
 
 lm_eval:
@@ -24,19 +23,13 @@ lm_eval:
       num_fewshot: 5
       model_args:
         num_concurrent: 64
-        max_length: 32768
-        max_gen_toks: 8192
-
-bfcl:
-  test_categories:
-    - simple_python
-    - multiple
-    - parallel
-    - parallel_multiple
-    - multi_turn
-  num_threads: 16
+        max_length: 40960
+        max_gen_toks: 65536
 
 vllm_bench:
+  metadata:
+    # The native-FP8 checkpoint has no precision marker in its repo name.
+    precision: fp8
   configs:
     - name: 8k-in-1k-out
       backend: openai

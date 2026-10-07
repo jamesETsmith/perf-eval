@@ -1,17 +1,19 @@
-# MiniMax-M2.5 on MI300X
-name: minimax_m2_5-mi300x
-gpu: MI300X
+name: qwen3_8_flash_next-h200
+gpu: H200
 num_gpus: 8
 nightly: true
 
 vllm:
-  model: MiniMaxAI/MiniMax-M2.5
-  env:
-    VLLM_ROCM_USE_AITER: 1
+  model: Qwen/Qwen3.8-Flash-Next-FP8
   serve_args: >-
     --tensor-parallel-size 8
     --enable-expert-parallel
+    --speculative-config.method mtp
+    --speculative-config.num_speculative_tokens 2
+    --reasoning-parser qwen3
     --trust-remote-code
+    --max-num-seqs 256
+    --max-model-len auto
 
 lm_eval:
   model_args:
@@ -24,16 +26,17 @@ lm_eval:
       model_args:
         num_concurrent: 64
         max_length: 40960
-        max_gen_toks: 32768
+        max_gen_toks: 65536
 
 vllm_bench:
   configs:
-    - name: 1k-in-1k-out
+    - name: 8k-in-1k-out
       backend: openai
       dataset: random
-      input_len: 1024
+      input_len: 8192
       output_len: 1024
-      num_prompts: [10, 256, 512]
-      max_concurrency: [1, 64, 128]
-      speed_bench_dataset_subset: throughput_8k
-      speed_bench_category: low_entropy
+      num_prompts: 256
+      max_concurrency: 128
+      repetitions: 3
+      args:
+        num_warmups: 128

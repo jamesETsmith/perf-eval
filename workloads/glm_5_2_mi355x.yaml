@@ -1,16 +1,15 @@
-# MiniMax-M2.5 on MI300X
-name: minimax_m2_5-mi300x
-gpu: MI300X
+# GLM-5.2 (FP8) on AMD MI355X
+name: glm_5_2-mi355x
+gpu: MI355X
 num_gpus: 8
 nightly: true
 
 vllm:
-  model: MiniMaxAI/MiniMax-M2.5
+  model: zai-org/GLM-5.2-FP8
   env:
     VLLM_ROCM_USE_AITER: 1
   serve_args: >-
     --tensor-parallel-size 8
-    --enable-expert-parallel
     --trust-remote-code
 
 lm_eval:
@@ -28,6 +27,15 @@ lm_eval:
 
 vllm_bench:
   configs:
+    - name: 8k-in-1k-out
+      backend: openai
+      dataset: random
+      input_len: 8192
+      output_len: 1024
+      num_prompts: 512
+      max_concurrency: 128
+      speed_bench_dataset_subset: throughput_8k
+      speed_bench_category: low_entropy
     - name: 1k-in-1k-out
       backend: openai
       dataset: random

@@ -27,48 +27,26 @@ class ProvenanceTests(unittest.TestCase):
     def setUpClass(cls):
         cls.provenance = load_module("provenance", ROOT / "lib" / "provenance.py")
 
-    def test_source_metadata_records_repository_without_inspecting_worktree(self):
-        completed = {
-            ("config", "--get", "remote.origin.url"): "git@example.test:vllm.git\n",
-            ("rev-parse", "HEAD"): "abc123\n",
-            ("rev-parse", "--show-toplevel"): "/src\n",
-        }
-
-        def run_git(path, *args):
-            return completed[args]
-
-        with mock.patch.object(self.provenance, "run_git", side_effect=run_git):
-            source = self.provenance.source_metadata(Path("/src/vllm"))
-
-        self.assertEqual(source["repository"], "git@example.test:vllm.git")
-        self.assertEqual(source["commit"], "abc123")
-        self.assertEqual(source["context_subdirectory"], "vllm")
-        self.assertNotIn("dirty", source)
-
     def test_native_image_metadata_does_not_require_docker(self):
         with mock.patch.object(self.provenance.subprocess, "run") as run:
             metadata = self.provenance.image_metadata("registry/image:tag", runtime="native")
         self.assertEqual(metadata, {"reference": "registry/image:tag", "id": "", "repo_digests": []})
         run.assert_not_called()
 
-    def test_build_image_stdout_contains_only_image_id(self):
+    def test_build_image_uses_an_empty_context(self):
         completed = [mock.Mock(stdout=""), mock.Mock(stdout="sha256:123\n")]
         with mock.patch.object(
             self.provenance.subprocess, "run", side_effect=completed
         ) as run:
             image_id = self.provenance.build_image(
-                "local/test:dev", Path("Dockerfile"), Path("."), {}
+                "local/test:dev", Path("Dockerfile")
             )
         self.assertEqual(image_id, "sha256:123")
+        build_command = run.call_args_list[0].args[0]
+        self.assertEqual(build_command[:5], ["docker", "build", "--tag", "local/test:dev", "--file"])
+        self.assertNotEqual(Path(build_command[-1]).resolve(), ROOT)
+        self.assertTrue(Path(build_command[-1]).name.startswith("tmp"))
         self.assertIs(run.call_args_list[0].kwargs["stdout"], self.provenance.sys.stderr)
-
-    def test_sensitive_build_args_are_redacted(self):
-        sanitized = self.provenance.sanitize_build_args(
-            {"CUDA_ARCH": "90", "HF_TOKEN": "secret", "api-key": "secret"}
-        )
-        self.assertEqual(sanitized["CUDA_ARCH"], "90")
-        self.assertEqual(sanitized["HF_TOKEN"], "<redacted>")
-        self.assertEqual(sanitized["api-key"], "<redacted>")
 
     def test_manifest_copies_inputs_and_is_self_contained(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -79,10 +57,6 @@ class ProvenanceTests(unittest.TestCase):
             workload.write_text("name: test\n")
             dockerfile.write_text("FROM scratch\n")
             with mock.patch.object(
-                self.provenance,
-                "source_metadata",
-                return_value={"repository": "repo", "commit": "abc"},
-            ), mock.patch.object(
                 self.provenance,
                 "image_metadata",
                 return_value={
@@ -97,8 +71,6 @@ class ProvenanceTests(unittest.TestCase):
                     image="local/test:dev",
                     image_id="sha256:123",
                     dockerfile=dockerfile,
-                    build_context=root,
-                    build_args={"MODE": "dev"},
                     runtime="docker",
                     environment="CUDA_VISIBLE_DEVICES=0\nHF_TOKEN=secret",
                 )
@@ -106,7 +78,7 @@ class ProvenanceTests(unittest.TestCase):
             manifest = json.loads(manifest_path.read_text())
             self.assertEqual(manifest["schema_version"], 1)
             self.assertEqual(manifest["image"]["id"], "sha256:123")
-            self.assertNotIn("dirty", manifest["source"])
+            self.assertNotIn("source", manifest)
             self.assertEqual(manifest["environment"]["CUDA_VISIBLE_DEVICES"], "0")
             self.assertEqual(manifest["environment"]["HF_TOKEN"], "<redacted>")
             self.assertEqual(manifest["build"]["dockerfile"], "docker/Dockerfile")
@@ -140,8 +112,6 @@ class ParserBuildTests(unittest.TestCase):
                 "image": "local/vllm:test",
                 "build": {
                     "dockerfile": "Dockerfile",
-                    "context": ".",
-                    "args": {"CUDA_ARCH": "90"},
                 },
             },
             "vllm_bench": {
@@ -161,8 +131,8 @@ class ParserBuildTests(unittest.TestCase):
         result = self.run_parser(self.workload())
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("WORKLOAD_BUILD_DOCKERFILE=", result.stdout)
-        self.assertIn("WORKLOAD_BUILD_CONTEXT=", result.stdout)
-        self.assertIn("WORKLOAD_BUILD_ARGS_JSON=", result.stdout)
+        self.assertNotIn("WORKLOAD_BUILD_CONTEXT=", result.stdout)
+        self.assertNotIn("WORKLOAD_BUILD_ARGS_JSON=", result.stdout)
 
     def test_build_requires_explicit_image_tag(self):
         workload = self.workload()
@@ -172,9 +142,56 @@ class ParserBuildTests(unittest.TestCase):
         self.assertIn("vllm.image", result.stderr)
 
     def test_build_rejects_image_override(self):
-        result = self.run_parser(self.workload(), {"VLLM_IMAGE": "override:test"})
+        for variable in ("VLLM_IMAGE", "VLLM_IMAGE_CUDA", "VLLM_IMAGE_ROCM", "VLLM_COMMIT"):
+            with self.subTest(variable=variable):
+                result = self.run_parser(self.workload(), {variable: "override"})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("cannot be combined", result.stderr)
+
+    def test_build_rejects_pin_image(self):
+        workload = self.workload()
+        workload["vllm"]["pin_image"] = True
+        result = self.run_parser(workload)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("cannot be combined", result.stderr)
+        self.assertIn("pin_image", result.stderr)
+
+    def test_build_rejects_local_context_and_args(self):
+        for field, value in (("context", "."), ("args", {"MODE": "dev"})):
+            with self.subTest(field=field):
+                workload = self.workload()
+                workload["vllm"]["build"][field] = value
+                result = self.run_parser(workload)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("unsupported fields", result.stderr)
+
+    def test_rejects_credentials_in_workload_environment(self):
+        workload = self.workload()
+        workload["vllm"]["env"] = {"HF_TOKEN": "secret"}
+        result = self.run_parser(workload)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("credentials must not be stored", result.stderr)
+
+    def test_profile_override_supports_replay_workloads_outside_repo(self):
+        workload = self.workload()
+        del workload["vllm"]["build"]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "workload.yaml"
+            profiles = Path(tmp) / "profiles.yaml"
+            path.write_text(yaml.safe_dump(workload))
+            profiles.write_text(yaml.safe_dump({"H200": {}}))
+            env = {
+                **os.environ,
+                "BENCH_ONLY": "1",
+                "PERF_EVAL_PROFILES_FILE": str(profiles),
+            }
+            result = subprocess.run(
+                ["python3", str(ROOT / "lib" / "parse_workload.py"), str(path)],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == "__main__":

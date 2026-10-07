@@ -12,43 +12,36 @@ import sys
 
 with open(sys.argv[1]) as file:
     manifest = json.load(file)
-source = manifest.get("source") or {}
 build = manifest.get("build") or {}
-print(source.get("repository", ""))
-print(source.get("commit", ""))
-print(json.dumps(build.get("args") or {}, separators=(",", ":")))
-print(source.get("context_subdirectory", "."))
+image = manifest.get("image") or {}
+print(build.get("dockerfile", ""))
+print(image.get("id", ""))
 PY
 )
-REPOSITORY="${FIELDS[0]}"
-COMMIT="${FIELDS[1]}"
-BUILD_ARGS_JSON="${FIELDS[2]}"
-CONTEXT_SUBDIRECTORY="${FIELDS[3]}"
+DOCKERFILE="${FIELDS[0]}"
+EXPECTED_IMAGE_ID="${FIELDS[1]}"
 
-[[ -n "$REPOSITORY" && -n "$COMMIT" ]] || {
-  echo "manifest does not contain build source metadata" >&2
+[[ -n "$DOCKERFILE" ]] || {
+  echo "manifest does not contain a captured Dockerfile" >&2
   exit 2
 }
-if [[ "$BUILD_ARGS_JSON" == *'"<redacted>"'* ]]; then
-  echo "manifest contains redacted build arguments and cannot be replayed unattended" >&2
+[[ "$DOCKERFILE" != /* && "$DOCKERFILE" != *".."* ]] || {
+  echo "manifest contains an invalid Dockerfile path: $DOCKERFILE" >&2
   exit 2
-fi
+}
 
 REPLAY_DIR="$(mktemp -d)"
 trap 'rm -rf "$REPLAY_DIR"' EXIT
-git clone --no-checkout "$REPOSITORY" "$REPLAY_DIR/source"
-git -C "$REPLAY_DIR/source" checkout --detach "$COMMIT"
-BUILD_CONTEXT="$REPLAY_DIR/source"
-if [[ "$CONTEXT_SUBDIRECTORY" != "." ]]; then
-  BUILD_CONTEXT="${BUILD_CONTEXT}/${CONTEXT_SUBDIRECTORY}"
-fi
-[[ -d "$BUILD_CONTEXT" ]] || { echo "recorded build context not found: $BUILD_CONTEXT" >&2; exit 2; }
-IMAGE="perf-eval-replay:${COMMIT:0:12}"
-python3 "$DIR/provenance.py" build \
+IMAGE="perf-eval-replay:$(printf '%s' "$EXPECTED_IMAGE_ID" | sha256sum | cut -c1-12)"
+REBUILT_IMAGE_ID="$(python3 "$DIR/provenance.py" build \
   --image "$IMAGE" \
-  --dockerfile "$PROVENANCE_DIR/docker/Dockerfile" \
-  --context "$BUILD_CONTEXT" \
-  --args-json "$BUILD_ARGS_JSON" >/dev/null
+  --dockerfile "$PROVENANCE_DIR/$DOCKERFILE")"
+if [[ -n "$EXPECTED_IMAGE_ID" && "$REBUILT_IMAGE_ID" != "$EXPECTED_IMAGE_ID" ]]; then
+  echo "rebuilt image ID does not match the recorded image ID" >&2
+  echo "recorded: $EXPECTED_IMAGE_ID" >&2
+  echo "rebuilt:  $REBUILT_IMAGE_ID" >&2
+  exit 2
+fi
 REPLAY_WORKLOAD="$REPLAY_DIR/workload.yaml"
 python3 - "$PROVENANCE_DIR/workload.yaml" "$REPLAY_WORKLOAD" "$IMAGE" <<'PY'
 import sys
@@ -61,4 +54,4 @@ workload["vllm"]["image"] = sys.argv[3]
 with open(sys.argv[2], "w") as file:
     yaml.safe_dump(workload, file, sort_keys=False)
 PY
-"$DIR/run.sh" "$REPLAY_WORKLOAD"
+PERF_EVAL_PROFILES_FILE="$DIR/gpu_profiles.yaml" "$DIR/run.sh" "$REPLAY_WORKLOAD"
