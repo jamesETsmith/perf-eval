@@ -33,6 +33,31 @@ class ProvenanceTests(unittest.TestCase):
         self.assertEqual(metadata, {"reference": "registry/image:tag", "id": "", "repo_digests": []})
         run.assert_not_called()
 
+    def test_docker_image_metadata_uses_running_container_without_pull(self):
+        completed = [
+            mock.Mock(stdout="sha256:123\n"),
+            mock.Mock(stdout='["registry/image@sha256:abc"]\n'),
+        ]
+        with mock.patch.object(
+            self.provenance.subprocess, "run", side_effect=completed
+        ) as run:
+            metadata = self.provenance.image_metadata(
+                "registry/image:tag", runtime="docker", container="running-vllm"
+            )
+        self.assertEqual(
+            metadata,
+            {
+                "reference": "registry/image:tag",
+                "id": "sha256:123",
+                "repo_digests": ["registry/image@sha256:abc"],
+            },
+        )
+        self.assertEqual(
+            run.call_args_list[0].args[0],
+            ["docker", "container", "inspect", "running-vllm", "--format", "{{.Image}}"],
+        )
+        self.assertTrue(all("pull" not in call.args[0] for call in run.call_args_list))
+
     def test_build_image_uses_an_empty_context(self):
         completed = [mock.Mock(stdout=""), mock.Mock(stdout="sha256:123\n")]
         with mock.patch.object(
@@ -47,6 +72,13 @@ class ProvenanceTests(unittest.TestCase):
         self.assertNotEqual(Path(build_command[-1]).resolve(), ROOT)
         self.assertTrue(Path(build_command[-1]).name.startswith("tmp"))
         self.assertIs(run.call_args_list[0].kwargs["stdout"], self.provenance.sys.stderr)
+
+    def test_capture_runs_after_server_start(self):
+        script = (ROOT / "lib" / "run.sh").read_text()
+        self.assertLess(
+            script.index('start_server "$CONTAINER"'),
+            script.index('python3 "$DIR/provenance.py" "${PROVENANCE_ARGS[@]}"'),
+        )
 
     def test_manifest_copies_inputs_and_is_self_contained(self):
         with tempfile.TemporaryDirectory() as tmp:

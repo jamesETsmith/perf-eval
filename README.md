@@ -242,7 +242,7 @@ results/<workload>/
 └── bfcl-<category>/
 ```
 
-The manifest records the exact workload and its checksum, resolved image ID and available repository digests, runtime, sanitized workload environment, and the captured Dockerfile for locally built images. Local builds use an empty context: the Dockerfile is the only local input, and any source or patches must come from public, commit-pinned locations. `INGEST_BEARER_TOKEN` and the Kubernetes-provided `HF_TOKEN` remain outside workload provenance; other credentials must not be added to workload YAML.
+The manifest records the exact workload and its checksum, runtime, sanitized workload environment, and the captured Dockerfile for locally built images. Docker runs start through the existing `docker run` path before provenance inspects the running container's image ID and available repository digests; native Kubernetes runs continue to record the configured image reference only. Local builds use an empty context: the Dockerfile is the only local input, and any source or patches must come from public, commit-pinned locations. `INGEST_BEARER_TOKEN` and the Kubernetes-provided `HF_TOKEN` remain outside workload provenance; other credentials must not be added to workload YAML.
 
 Buildkite already uploads `results/**/*`, so the bundle is retained with raw results. Both accuracy and performance ingestion payloads also include the same provenance object, allowing a database row to retain the experiment definition with its result.
 

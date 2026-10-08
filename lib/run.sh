@@ -55,9 +55,6 @@ if [[ -n "$WORKLOAD_BUILD_DOCKERFILE" ]]; then
     --dockerfile "$BUILD_DOCKERFILE"
   )
 fi
-python3 "$DIR/provenance.py" "${PROVENANCE_ARGS[@]}"
-WORKLOAD_PROVENANCE_FILE="${RESULTS_DIR}/provenance/manifest.json"
-export WORKLOAD_PROVENANCE_FILE
 
 # nsys profiling (NVIDIA profiles only, see parse_workload.py) needs a
 # vllm_bench config to drive the profiled run.
@@ -71,6 +68,12 @@ trap 'nsys_finalize "$CONTAINER"; stop_server "$CONTAINER"' EXIT
 
 start_server "$CONTAINER" "$PORT" "$WORKLOAD_IMAGE" "$WORKLOAD_MODEL" \
              "$WORKLOAD_SERVE_ARGS" "$WORKLOAD_ENV" "$WORKLOAD_SERVER_RUNTIME"
+if [[ "$WORKLOAD_SERVER_RUNTIME" == "docker" ]]; then
+  PROVENANCE_ARGS+=(--container "$CONTAINER")
+fi
+python3 "$DIR/provenance.py" "${PROVENANCE_ARGS[@]}"
+WORKLOAD_PROVENANCE_FILE="${RESULTS_DIR}/provenance/manifest.json"
+export WORKLOAD_PROVENANCE_FILE
 wait_healthy "$PORT" "$WORKLOAD_SERVER_STARTUP_TIMEOUT" "$WORKLOAD_MODEL"
 
 # vllm bench serve runs first so we can validate perf flow without waiting

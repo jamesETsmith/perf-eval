@@ -34,35 +34,30 @@ def file_record(path: Path) -> dict:
     }
 
 
-def image_metadata(image: str, image_id: str = "", runtime: str = "docker") -> dict:
+def image_metadata(
+    image: str,
+    image_id: str = "",
+    runtime: str = "docker",
+    container: str = "",
+) -> dict:
     if runtime != "docker":
         return {"reference": image, "id": image_id, "repo_digests": []}
-    inspect_command = [
-        "docker", "image", "inspect", image, "--format", "{{json .RepoDigests}}"
-    ]
-    result = subprocess.run(
-        inspect_command,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-    )
-    if result.returncode != 0:
-        subprocess.run(["docker", "pull", image], check=True)
-        result = subprocess.run(
-            inspect_command,
-            check=True,
-            text=True,
-            stdout=subprocess.PIPE,
-        )
-    digests = json.loads(result.stdout)
-    if not image_id:
+    if container:
         image_id = subprocess.run(
-            ["docker", "image", "inspect", image, "--format", "{{.Id}}"],
+            ["docker", "container", "inspect", container, "--format", "{{.Image}}"],
             check=True,
             text=True,
             stdout=subprocess.PIPE,
         ).stdout.strip()
-    return {"reference": image, "id": image_id, "repo_digests": digests}
+    elif not image_id:
+        raise RuntimeError("docker provenance requires a running container or built image ID")
+    result = subprocess.run(
+        ["docker", "image", "inspect", image_id, "--format", "{{json .RepoDigests}}"],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    )
+    return {"reference": image, "id": image_id, "repo_digests": json.loads(result.stdout)}
 
 
 def build_image(image: str, dockerfile: Path) -> str:
@@ -88,6 +83,7 @@ def capture(
     dockerfile: Path | None,
     runtime: str,
     environment: str = "",
+    container: str = "",
 ) -> Path:
     provenance_dir = results_dir / "provenance"
     docker_dir = provenance_dir / "docker"
@@ -100,7 +96,7 @@ def capture(
     manifest = {
         "schema_version": 1,
         "workload": {"path": "workload.yaml", **file_record(workload_copy)},
-        "image": image_metadata(image, image_id, runtime),
+        "image": image_metadata(image, image_id, runtime, container),
         "runtime": runtime,
         "environment": sanitize_environment(environment),
     }
@@ -135,6 +131,7 @@ def main() -> int:
     capture_parser.add_argument("--dockerfile", type=Path)
     capture_parser.add_argument("--runtime", required=True)
     capture_parser.add_argument("--environment", default="")
+    capture_parser.add_argument("--container", default="")
 
     args = parser.parse_args()
     try:
@@ -150,6 +147,7 @@ def main() -> int:
                     args.dockerfile,
                     args.runtime,
                     args.environment,
+                    args.container,
                 )
             )
     except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
