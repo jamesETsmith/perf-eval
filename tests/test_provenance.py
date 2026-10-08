@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -119,6 +120,126 @@ class ProvenanceTests(unittest.TestCase):
                 (results / "provenance" / "docker" / "Dockerfile").read_text(),
                 "FROM scratch\n",
             )
+
+
+class ReplayTests(unittest.TestCase):
+    def create_replay_fixture(self, root: Path, image_id="sha256:123") -> tuple[Path, Path]:
+        lib = root / "lib"
+        provenance_dir = root / "bundle"
+        docker_dir = provenance_dir / "docker"
+        lib.mkdir()
+        docker_dir.mkdir(parents=True)
+        (lib / "replay.sh").write_text((ROOT / "lib" / "replay.sh").read_text())
+        (lib / "gpu_profiles.yaml").write_text("H200: {}\n")
+        (lib / "provenance.py").write_text(
+            "#!/usr/bin/env python3\nimport os\nprint(os.environ['REBUILT_IMAGE_ID'])\n"
+        )
+        (lib / "run.sh").write_text(
+            "#!/usr/bin/env bash\nset -euo pipefail\n"
+            "cp \"$1\" \"${REPLAY_RUN_RECORD}.workload\"\n"
+            "printf '%s\\n' \"$PERF_EVAL_PROFILES_FILE\" \"${REPLAY_RUN_RECORD}.workload\" > \"$REPLAY_RUN_RECORD\"\n"
+        )
+        (lib / "provenance.py").chmod(0o755)
+        (lib / "run.sh").chmod(0o755)
+        (lib / "replay.sh").chmod(0o755)
+        workload = (
+            "name: replay-test\n"
+            "gpu: H200\n"
+            "vllm:\n"
+            "  model: example/model\n"
+            "  image: local/test:dev\n"
+            "  build:\n"
+            "    dockerfile: Dockerfile\n"
+            "vllm_bench:\n"
+            "  configs: []\n"
+        )
+        dockerfile = "FROM scratch\n"
+        (provenance_dir / "workload.yaml").write_text(workload)
+        (docker_dir / "Dockerfile").write_text(dockerfile)
+        manifest = {
+            "schema_version": 1,
+            "workload": {
+                "path": "workload.yaml",
+                "content": workload,
+                "sha256": hashlib.sha256(workload.encode()).hexdigest(),
+            },
+            "image": {"reference": "local/test:dev", "id": image_id, "repo_digests": []},
+            "runtime": "docker",
+            "environment": {},
+            "build": {
+                "dockerfile": "docker/Dockerfile",
+                "dockerfile_record": {
+                    "content": dockerfile,
+                    "sha256": hashlib.sha256(dockerfile.encode()).hexdigest(),
+                },
+                "context": "empty",
+            },
+        }
+        manifest_path = provenance_dir / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest))
+        return manifest_path, root / "run-record"
+
+    def run_replay(self, manifest: Path, record: Path, rebuilt_image_id="sha256:123"):
+        env = {
+            **os.environ,
+            "REBUILT_IMAGE_ID": rebuilt_image_id,
+            "REPLAY_RUN_RECORD": str(record),
+        }
+        return subprocess.run(
+            ["bash", str(manifest.parents[1] / "lib" / "replay.sh"), str(manifest)],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+
+    def test_replay_validates_and_runs_captured_workload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest, record = self.create_replay_fixture(Path(tmp))
+            result = self.run_replay(manifest, record)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            profiles, workload = record.read_text().splitlines()
+            self.assertEqual(profiles, str(Path(tmp) / "lib" / "gpu_profiles.yaml"))
+            replayed = yaml.safe_load(Path(workload).read_text())
+            self.assertNotIn("build", replayed["vllm"])
+            self.assertTrue(replayed["vllm"]["image"].startswith("perf-eval-replay:"))
+
+    def test_replay_rejects_rebuilt_image_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest, record = self.create_replay_fixture(Path(tmp))
+            result = self.run_replay(manifest, record, rebuilt_image_id="sha256:different")
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("does not match", result.stderr)
+            self.assertFalse(record.exists())
+
+    def test_replay_rejects_schema_and_checksum_errors_before_build(self):
+        cases = (("schema_version", 2, "unsupported schema_version"),)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest, record = self.create_replay_fixture(root)
+            data = json.loads(manifest.read_text())
+            for field, value, message in cases:
+                with self.subTest(field=field):
+                    changed = json.loads(json.dumps(data))
+                    changed[field] = value
+                    manifest.write_text(json.dumps(changed))
+                    result = self.run_replay(manifest, record)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn(message, result.stderr)
+                    self.assertFalse(record.exists())
+            changed = json.loads(json.dumps(data))
+            changed["workload"]["sha256"] = "0" * 64
+            manifest.write_text(json.dumps(changed))
+            result = self.run_replay(manifest, record)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("workload checksum mismatch", result.stderr)
+            self.assertFalse(record.exists())
+            changed = json.loads(json.dumps(data))
+            changed["build"]["dockerfile_record"]["sha256"] = "0" * 64
+            manifest.write_text(json.dumps(changed))
+            result = self.run_replay(manifest, record)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("Dockerfile checksum mismatch", result.stderr)
+            self.assertFalse(record.exists())
 
 
 class ParserBuildTests(unittest.TestCase):

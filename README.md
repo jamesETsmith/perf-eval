@@ -252,7 +252,7 @@ Replay a locally built experiment with:
 ./lib/replay.sh results/<workload>/provenance/manifest.json
 ```
 
-Replay rebuilds the captured Dockerfile with the same empty-context restriction, verifies that its image ID matches the recorded build, and runs the captured workload with the rebuilt image. Because no local source context or build arguments are accepted, the Dockerfile must contain every public, commit-pinned input needed to recreate the image.
+Replay first validates the manifest schema and the recorded workload and Dockerfile checksums. It then rebuilds the captured Dockerfile with the same empty-context restriction, verifies that its image ID matches the recorded build, and runs the captured workload with the rebuilt image. Because no local source context or build arguments are accepted, the Dockerfile must contain every public, commit-pinned input needed to recreate the image.
 
 ## Agents
 
