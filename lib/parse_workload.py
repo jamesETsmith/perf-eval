@@ -230,6 +230,22 @@ def validate_build(vllm: dict, profile: dict, path: str) -> dict:
     return {"dockerfile": dockerfile}
 
 
+def apply_default_serve_args(serve_args: str, defaults: dict | None) -> str:
+    """Append a profile's default serve args the workload does not already set.
+
+    ``defaults`` maps an option to its value (``True``/``None`` for a bare flag),
+    e.g. ``{"--load-format": "fastsafetensors"}``. A workload overrides a default
+    by passing the option itself.
+    """
+    toks = serve_args.split()
+    extra = []
+    for opt, val in (defaults or {}).items():
+        if any(t == opt or t.startswith(opt + "=") for t in toks):
+            continue
+        extra.append(opt if val is True or val is None else f"{opt} {val}")
+    return " ".join([serve_args.strip(), *extra]).strip()
+
+
 def parse_tp(serve_args: str) -> int:
     """Effective parallel degree (TP * DP) from serve_args; defaults to 1.
 
@@ -585,6 +601,7 @@ def main(path: str) -> None:
         validate_bfcl(bfcl, serve_args, path)
     build = validate_build(vllm, profile, path)
 
+    serve_args = apply_default_serve_args(serve_args, profile.get("default_serve_args"))
     image, vllm_commit = resolve_image(vllm, profile)
     workload_env = vllm.get("env") or {}
     sensitive_env = sorted(str(name) for name in workload_env if SENSITIVE_NAME.search(str(name)))
